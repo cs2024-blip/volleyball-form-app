@@ -50,7 +50,9 @@ detector = vision.PoseLandmarker.create_from_options(options)
 VIDEO_EXTENSIONS = (
     ".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"
 )
-MAX_DISPLAY_FRAMES = 24
+
+# 候補を作る間隔。0.1秒 = 1秒間に約10コマ
+FRAME_INTERVAL_SECONDS = 0.1
 
 
 def detect_pose(rgb_image):
@@ -112,12 +114,17 @@ def load_media(file_path):
         None,
         None,
         gr.update(visible=True),
-        f"動画の長さは **{duration:.2f}秒** です。動画を再生して、ジャンプの少し前から着地後までの開始・終了位置を指定してください。"
+        (
+            f"動画の長さは **{duration:.2f}秒** です。"
+            "動画を再生して、ジャンプの少し前から着地後までの"
+            "開始・終了位置を指定してください。"
+            "<br>指定範囲から **0.1秒ごと** にコマ候補を作ります。"
+        )
     )
 
 
-def make_candidates(file_path, start_sec, end_sec):
-    """ユーザーが指定した時間範囲を静止画候補に分割する。"""
+def make_candidates(file_path, start_sec, end_sec, progress=gr.Progress()):
+    """指定範囲から0.1秒ごとに静止画候補を作る。候補数の上限は設けない。"""
     if not file_path:
         raise gr.Error("先に動画をアップロードしてください。")
 
@@ -136,7 +143,7 @@ def make_candidates(file_path, start_sec, end_sec):
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if not fps or fps <= 0 or total_frames <= 0:
+    if not fps or not np.isfinite(fps) or fps <= 0 or total_frames <= 0:
         cap.release()
         raise gr.Error("動画情報を読み取れませんでした。")
 
@@ -147,25 +154,43 @@ def make_candidates(file_path, start_sec, end_sec):
         cap.release()
         raise gr.Error("指定した範囲が短すぎます。開始・終了位置を確認してください。")
 
-    # 約0.25秒ごとに候補を作り、最大24コマに制限する。
-    desired_count = max(2, int((end_sec - start_sec) / 0.25) + 1)
-    count = min(MAX_DISPLAY_FRAMES, desired_count)
-    times = np.linspace(start_sec, end_sec, count)
+    # 0.1秒ごとの時刻を作成。最後の時刻も範囲内なら追加する。
+    span = end_sec - start_sec
+    count = int(math.floor(span / FRAME_INTERVAL_SECONDS)) + 1
+    times = [
+        start_sec + i * FRAME_INTERVAL_SECONDS
+        for i in range(count)
+    ]
+    if not times or end_sec - times[-1] > 0.000001:
+        times.append(end_sec)
 
     candidates = []
     candidate_times = []
-    for sec in times:
+    total = len(times)
+
+    print(
+        f"候補フレーム作成開始: {start_sec:.2f}秒〜{end_sec:.2f}秒"
+        f" / 予定 {total}コマ / 0.1秒間隔"
+    )
+
+    for i, sec in enumerate(times):
         frame_number = min(
             total_frames - 1,
             max(0, int(round(float(sec) * fps)))
         )
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ok, bgr = cap.read()
-        if not ok or bgr is None:
-            continue
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        candidates.append(rgb)
-        candidate_times.append(float(sec))
+        if ok and bgr is not None:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            candidates.append(rgb)
+            candidate_times.append(float(sec))
+
+        if i % 10 == 0 or i == total - 1:
+            progress(
+                (i + 1) / total,
+                desc=f"コマを取り出しています… {i + 1}/{total}"
+            )
 
     cap.release()
 
@@ -176,16 +201,21 @@ def make_candidates(file_path, start_sec, end_sec):
         (Image.fromarray(frame), f"{sec:.2f}秒")
         for frame, sec in zip(candidates, candidate_times)
     ]
+
     print(
-        f"手動指定範囲から候補を作成: {start_sec:.2f}秒〜"
-        f"{end_sec:.2f}秒 / {len(candidates)}コマ"
+        f"候補フレーム作成完了: {len(candidates)}コマ"
+        f" / {start_sec:.2f}秒〜{end_sec:.2f}秒"
     )
+
     return (
         gallery,
         candidates,
         candidates[0],
         candidates[0],
-        f"**{len(candidates)}コマ** の候補を作りました。比較したい瞬間の画像をクリックしてください。"
+        (
+            f"**{len(candidates)}コマ** の候補を作りました"
+            f"（約0.1秒ごと）。比較したい瞬間の画像をクリックしてください。"
+        )
     )
 
 
@@ -245,7 +275,6 @@ def analyze_frame(rgb):
     for i, lm in enumerate(landmarks):
         points[i] = np.array([lm.x * w, lm.y * h])
 
-    # 必要な関節点が検出できた場合だけ角度を計算する。
     required = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
     if not all(i in points for i in required):
         return points, angles
@@ -301,7 +330,6 @@ def compare_forms(reference_rgb, self_rgb):
             "人物の姿勢を検出できませんでした。全身が写る画像を使ってください。"
         )
 
-    # 必要な関節点が両方にあるか確認する。
     required = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
     if not all(i in pts_r for i in required) or not all(
         i in pts_s for i in required
@@ -311,7 +339,6 @@ def compare_forms(reference_rgb, self_rgb):
             "全身が写る画像を使ってください。"
         )
 
-    # 自分の画像の大きさに合わせてお手本を変形
     h_s, w_s = own.shape[:2]
 
     hip_r = (pts_r[23] + pts_r[24]) / 2
@@ -331,8 +358,6 @@ def compare_forms(reference_rgb, self_rgb):
     ])
 
     aligned_ref = cv2.warpAffine(ref, matrix, (w_s, h_s))
-
-    # 自分とお手本を重ねる
     overlay = cv2.addWeighted(own, 0.8, aligned_ref, 0.3, 0)
 
     # 自分：緑、お手本：赤
@@ -348,7 +373,6 @@ def compare_forms(reference_rgb, self_rgb):
         p2 = tuple(np.round(p2).astype(int))
         cv2.line(overlay, p1, p2, (255, 0, 0), 3)
 
-    # 角度比較表
     rows = [
         "| 関節 | お手本 | 自分 | 差 |",
         "|---|---:|---:|---:|"
@@ -387,7 +411,7 @@ with gr.Blocks(title="バレーボールフォーム比較") as app:
         お手本と自分の画像・動画からフレームを選び、
         フォームの重ね合わせと関節角度を比較します。
 
-        **動画の場合：** 動画を確認し、ジャンプの少し前から着地後までの範囲を自分で指定します。その範囲をコマに分け、候補から比較したい瞬間を選べます。
+        **動画の場合：** 動画を確認し、ジャンプの少し前から着地後までの範囲を自分で指定します。その範囲を **0.1秒ごと** にコマに分け、候補から比較したい瞬間を選べます。
         """
     )
 
@@ -408,7 +432,7 @@ with gr.Blocks(title="バレーボールフォーム比較") as app:
             ref_gallery = gr.Gallery(
                 label="比較したいコマをクリック",
                 columns=4,
-                height=300,
+                height=500,
                 object_fit="contain"
             )
             ref_preview = gr.Image(label="選択中のお手本")
@@ -431,7 +455,7 @@ with gr.Blocks(title="バレーボールフォーム比較") as app:
             self_gallery = gr.Gallery(
                 label="比較したいコマをクリック",
                 columns=4,
-                height=300,
+                height=500,
                 object_fit="contain"
             )
             self_preview = gr.Image(label="選択中の自分のフォーム")
