@@ -51,12 +51,16 @@ VIDEO_EXTENSIONS = (
     ".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"
 )
 
-# 動画のジャンプ検出では、動画の全フレームを解析しない。
-# 最大180地点を小さく縮小して確認し、検出した区間だけを候補画像にする。
-MAX_SCAN_SAMPLES = 180
-MIN_SCAN_INTERVAL_SEC = 0.20
-FRAME_DISPLAY_INTERVAL_SEC = 0.15
-MAX_DISPLAY_FRAMES = 24
+# 動画の仮解析を軽量化
+# 以前は最大180コマだったが、最大30コマに減らす。
+MAX_SCAN_SAMPLES = 30
+MIN_SCAN_INTERVAL_SEC = 0.5
+
+# 表示する候補画像も減らして、画面表示を軽くする。
+FRAME_DISPLAY_INTERVAL_SEC = 0.25
+MAX_DISPLAY_FRAMES = 16
+
+# 腰が通常位置より上がったと判断する差（正規化座標）
 JUMP_HEIGHT_THRESHOLD = 0.035
 
 
@@ -70,14 +74,14 @@ def detect_pose(rgb_image):
 
 
 def _resize_for_detection(rgb):
-    """ジャンプ検出用に画像を縮小する（ランドマーク座標は正規化値）"""
+    """ジャンプ検出用に画像を縮小する"""
     h, w = rgb.shape[:2]
     longest = max(h, w)
 
-    if longest <= 384:
+    if longest <= 256:
         return rgb
 
-    scale = 384.0 / longest
+    scale = 256.0 / longest
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     return cv2.resize(
@@ -90,7 +94,6 @@ def _resize_for_detection(rgb):
 def _find_jump_interval(sample_times, hip_y_values, duration):
     """
     腰の上下移動からジャンプ区間を推定する。
-    画像上では、ジャンプして上がるほど腰のy座標が小さくなる。
     戻り値はジャンプ開始・終了の秒数。検出できない場合はNone。
     """
     valid = [
@@ -102,20 +105,15 @@ def _find_jump_interval(sample_times, hip_y_values, duration):
         return None
 
     values = np.array([y for _, y in valid], dtype=float)
-
-    # 多くの時間で立っている位置を基準にする。
-    # y座標は大きいほど画面下側なので、70パーセンタイルを基準にする。
     baseline = float(np.percentile(values, 70))
 
-    airborne = []
-    for i, y in enumerate(hip_y_values):
-        airborne.append(
-            y is not None
-            and np.isfinite(y)
-            and y < baseline - JUMP_HEIGHT_THRESHOLD
-        )
+    airborne = [
+        y is not None
+        and np.isfinite(y)
+        and y < baseline - JUMP_HEIGHT_THRESHOLD
+        for y in hip_y_values
+    ]
 
-    # 連続する空中判定をグループ化する。
     groups = []
     start = None
 
@@ -129,16 +127,11 @@ def _find_jump_interval(sample_times, hip_y_values, duration):
     if start is not None:
         groups.append((start, len(airborne) - 1))
 
-    # 1点だけの誤検出は除外する。
-    groups = [
-        (a, b) for a, b in groups
-        if b > a
-    ]
+    groups = [(a, b) for a, b in groups if b > a]
 
     if not groups:
         return None
 
-    # 最も高く上がった（腰のy座標が最も小さい）グループを選ぶ。
     def group_strength(group):
         a, b = group
         group_values = [
@@ -152,12 +145,8 @@ def _find_jump_interval(sample_times, hip_y_values, duration):
 
     best_start, best_end = max(groups, key=group_strength)
 
-    start_time = sample_times[best_start]
-    end_time = sample_times[best_end]
-
-    # ジャンプ直前・着地後も少し含める。
-    start_time = max(0.0, start_time - 0.5)
-    end_time = min(duration, end_time + 0.5)
+    start_time = max(0.0, sample_times[best_start] - 0.5)
+    end_time = min(duration, sample_times[best_end] + 0.5)
 
     if end_time <= start_time:
         return None
@@ -176,19 +165,19 @@ def _read_frame_at(cap, frame_number):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def prepare_media(file_path):
+def prepare_media(file_path, progress=gr.Progress()):
     """
-    アップロード画像・動画から比較候補を作る。
-    動画は低頻度のサンプルだけでジャンプを検出し、
-    検出区間のコマだけをギャラリーに表示する。
+    画像・動画を読み込む。
+    動画は最大30コマだけAIで確認してジャンプ区間を推定する。
+    詳しい姿勢解析は、比較ボタンを押したときの選択フレームだけ行う。
     """
     if file_path is None:
         raise gr.Error("画像または動画をアップロードしてください。")
 
     ext = os.path.splitext(file_path)[1].lower()
 
-    # 画像の場合：従来どおり画像をそのまま候補にする。
     if ext not in VIDEO_EXTENSIONS:
+        progress(0.2, desc="画像を読み込んでいます")
         bgr = cv2.imread(file_path)
 
         if bgr is None:
@@ -196,12 +185,16 @@ def prepare_media(file_path):
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         gallery = [(Image.fromarray(rgb), "画像")]
+        progress(1.0, desc="完了")
         return gallery, [rgb], rgb, rgb
 
-    # 動画の場合
+    print(f"動画の処理を開始します: {os.path.basename(file_path)}")
+    progress(0.02, desc="動画を開いています")
+
     cap = cv2.VideoCapture(file_path)
 
     if not cap.isOpened():
+        cap.release()
         raise gr.Error("動画を開けませんでした。")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -217,24 +210,25 @@ def prepare_media(file_path):
 
     duration = total_frames / fps
 
-    # 動画全体をフレーム単位で解析せず、最大180地点だけを確認する。
-    scan_interval = max(
-        MIN_SCAN_INTERVAL_SEC,
-        duration / MAX_SCAN_SAMPLES
+    # 動画の長さに応じて最大30地点を選ぶ。
+    sample_count = min(
+        MAX_SCAN_SAMPLES,
+        max(4, int(np.ceil(duration / MIN_SCAN_INTERVAL_SEC)))
     )
-    sample_times = np.arange(0, duration, scan_interval)
-
-    if len(sample_times) == 0:
-        sample_times = np.array([0.0])
-
-    if len(sample_times) > MAX_SCAN_SAMPLES:
-        sample_times = np.linspace(
-            0, max(0.0, duration - 0.01), MAX_SCAN_SAMPLES
-        )
+    sample_times = np.linspace(
+        0,
+        max(0.0, duration - 1.0 / fps),
+        sample_count
+    )
 
     hip_y_values = []
 
-    for sec in sample_times:
+    print(
+        f"動画情報: {duration:.1f}秒 / {fps:.1f}fps / "
+        f"{total_frames}フレーム / AI確認 {sample_count}地点"
+    )
+
+    for i, sec in enumerate(sample_times):
         frame_number = min(
             total_frames - 1,
             int(round(float(sec) * fps))
@@ -243,26 +237,30 @@ def prepare_media(file_path):
 
         if rgb is None:
             hip_y_values.append(None)
-            continue
+        else:
+            try:
+                small_rgb = _resize_for_detection(rgb)
+                result = detect_pose(small_rgb)
 
-        try:
-            small_rgb = _resize_for_detection(rgb)
-            result = detect_pose(small_rgb)
+                if result.pose_landmarks:
+                    landmarks = result.pose_landmarks[0]
+                    hip_y = (
+                        landmarks[23].y + landmarks[24].y
+                    ) / 2.0
+                    hip_y_values.append(float(hip_y))
+                else:
+                    hip_y_values.append(None)
 
-            if result.pose_landmarks:
-                landmarks = result.pose_landmarks[0]
-
-                # 左右の腰の中間位置。正規化座標なので画像サイズに依存しない。
-                hip_y = (landmarks[23].y + landmarks[24].y) / 2.0
-                hip_y_values.append(float(hip_y))
-            else:
+            except Exception as e:
+                print(f"ジャンプ検出をスキップ: {e}")
                 hip_y_values.append(None)
 
-        except Exception as e:
-            print(f"ジャンプ検出用フレームの解析をスキップしました: {e}")
-            hip_y_values.append(None)
+        progress(
+            0.05 + 0.65 * ((i + 1) / sample_count),
+            desc=f"ジャンプを探しています ({i + 1}/{sample_count})"
+        )
 
-    # ジャンプ検出後に、選択肢として表示するコマを取り出す。
+    print("ジャンプ区間を判定しています...")
     jump_interval = _find_jump_interval(
         sample_times.tolist(),
         hip_y_values,
@@ -271,15 +269,20 @@ def prepare_media(file_path):
 
     if jump_interval is None:
         cap.release()
+        print("ジャンプを自動検出できませんでした。")
         raise gr.Error(
             "ジャンプを自動検出できませんでした。"
             "人物の全身、特に腰から足までが映る動画を使ってください。"
-            "カメラを固定し、ジャンプの前後に立っている時間がある動画がおすすめです。"
+            "ジャンプの前後に立っている時間がある動画がおすすめです。"
         )
 
     jump_start, jump_end = jump_interval
+    print(
+        f"ジャンプ区間: {jump_start:.2f}秒〜{jump_end:.2f}秒"
+    )
 
-    # ジャンプ区間だけを一定間隔で静止画にする。
+    progress(0.75, desc="ジャンプ中の画像を取り出しています")
+
     display_times = np.arange(
         jump_start,
         jump_end + 0.001,
@@ -296,7 +299,7 @@ def prepare_media(file_path):
     candidates = []
     candidate_times = []
 
-    for sec in display_times:
+    for i, sec in enumerate(display_times):
         frame_number = min(
             total_frames - 1,
             int(round(float(sec) * fps))
@@ -307,24 +310,25 @@ def prepare_media(file_path):
             candidates.append(rgb)
             candidate_times.append(float(sec))
 
+        progress(
+            0.75 + 0.20 * ((i + 1) / max(1, len(display_times))),
+            desc=f"候補画像を準備しています ({i + 1}/{len(display_times)})"
+        )
+
     cap.release()
 
     if not candidates:
         raise gr.Error("ジャンプ区間の画像を取り出せませんでした。")
 
     gallery = [
-        (
-            Image.fromarray(frame),
-            f"{sec:.2f}秒"
-        )
+        (Image.fromarray(frame), f"{sec:.2f}秒")
         for frame, sec in zip(candidates, candidate_times)
     ]
 
     print(
-        f"ジャンプ候補を検出しました: "
-        f"{jump_start:.2f}秒〜{jump_end:.2f}秒 / "
-        f"{len(candidates)}コマ"
+        f"動画処理完了: {len(candidates)}コマを候補として表示します。"
     )
+    progress(1.0, desc="完了")
 
     return gallery, candidates, candidates[0], candidates[0]
 
@@ -339,7 +343,6 @@ def select_frame(candidates, evt: gr.SelectData):
 
     index = evt.index
 
-    # Gradioのバージョンによるindex形式の違いに対応
     if isinstance(index, (tuple, list)):
         index = index[0]
 
@@ -385,7 +388,6 @@ def analyze_frame(rgb):
     for i, lm in enumerate(landmarks):
         points[i] = np.array([lm.x * w, lm.y * h])
 
-    # 必要な関節点が検出できた場合だけ角度を計算する。
     required = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
     if not all(i in points for i in required):
         return points, angles
@@ -441,7 +443,6 @@ def compare_forms(reference_rgb, self_rgb):
             "人物の姿勢を検出できませんでした。全身が写る画像を使ってください。"
         )
 
-    # 必要な関節点が両方にあるか確認する。
     required = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
     if not all(i in pts_r for i in required) or not all(
         i in pts_s for i in required
@@ -451,7 +452,6 @@ def compare_forms(reference_rgb, self_rgb):
             "全身が写る画像を使ってください。"
         )
 
-    # 自分の画像の大きさに合わせてお手本を変形
     h_s, w_s = own.shape[:2]
 
     hip_r = (pts_r[23] + pts_r[24]) / 2
@@ -471,8 +471,6 @@ def compare_forms(reference_rgb, self_rgb):
     ])
 
     aligned_ref = cv2.warpAffine(ref, matrix, (w_s, h_s))
-
-    # 自分とお手本を重ねる
     overlay = cv2.addWeighted(own, 0.8, aligned_ref, 0.3, 0)
 
     # 自分：緑、お手本：赤
@@ -488,7 +486,6 @@ def compare_forms(reference_rgb, self_rgb):
         p2 = tuple(np.round(p2).astype(int))
         cv2.line(overlay, p1, p2, (255, 0, 0), 3)
 
-    # 角度比較表
     rows = [
         "| 関節 | お手本 | 自分 | 差 |",
         "|---|---:|---:|---:|"
@@ -573,7 +570,8 @@ with gr.Blocks(title="バレーボールフォーム比較") as app:
         outputs=[
             ref_gallery, ref_candidates,
             ref_selected, ref_preview
-        ]
+        ],
+        show_progress="full"
     )
 
     self_file.change(
@@ -582,7 +580,8 @@ with gr.Blocks(title="バレーボールフォーム比較") as app:
         outputs=[
             self_gallery, self_candidates,
             self_selected, self_preview
-        ]
+        ],
+        show_progress="full"
     )
 
     ref_gallery.select(
