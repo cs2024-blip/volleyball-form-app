@@ -118,13 +118,13 @@ def load_media(file_path):
             f"動画の長さは **{duration:.2f}秒** です。"
             "動画を再生して、ジャンプの少し前から着地後までの"
             "開始・終了位置を指定してください。"
-            "<br>指定範囲から **0.1秒ごと** にコマ候補を作ります。"
+            "<br>指定範囲から **0.05秒ごと** にコマ候補を作ります。"
         )
     )
 
 
 def make_candidates(file_path, start_sec, end_sec, progress=gr.Progress()):
-    """指定範囲から0.1秒ごとに静止画候補を作る。候補数の上限は設けない。"""
+    """指定範囲から0.05秒ごとに静止画候補を作る。候補数の上限は設けない。"""
     if not file_path:
         raise gr.Error("先に動画をアップロードしてください。")
 
@@ -154,7 +154,7 @@ def make_candidates(file_path, start_sec, end_sec, progress=gr.Progress()):
         cap.release()
         raise gr.Error("指定した範囲が短すぎます。開始・終了位置を確認してください。")
 
-    # 0.1秒ごとの時刻を作成。最後の時刻も範囲内なら追加する。
+    # 0.05秒ごとの時刻を作成。最後の時刻も範囲内なら追加する。
     span = end_sec - start_sec
     count = int(math.floor(span / FRAME_INTERVAL_SECONDS)) + 1
     times = [
@@ -170,7 +170,7 @@ def make_candidates(file_path, start_sec, end_sec, progress=gr.Progress()):
 
     print(
         f"候補フレーム作成開始: {start_sec:.2f}秒〜{end_sec:.2f}秒"
-        f" / 予定 {total}コマ / 0.1秒間隔"
+        f" / 予定 {total}コマ / 0.05秒間隔"
     )
 
     for i, sec in enumerate(times):
@@ -214,7 +214,7 @@ def make_candidates(file_path, start_sec, end_sec, progress=gr.Progress()):
         candidates[0],
         (
             f"**{len(candidates)}コマ** の候補を作りました"
-            f"（約0.1秒ごと）。比較したい瞬間の画像をクリックしてください。"
+            f"（約0.05秒ごと）。比較したい瞬間の画像をクリックしてください。"
         )
     )
 
@@ -411,7 +411,7 @@ with gr.Blocks(title="バレーボールフォーム比較") as app:
         お手本と自分の画像・動画からフレームを選び、
         フォームの重ね合わせと関節角度を比較します。
 
-        **動画の場合：** 動画を確認し、ジャンプの少し前から着地後までの範囲を自分で指定します。その範囲を **0.1秒ごと** にコマに分け、候補から比較したい瞬間を選べます。
+        **動画の場合：** 動画を確認し、ジャンプの少し前から着地後までの範囲を自分で指定します。その範囲を **0.05秒ごと** にコマに分け、候補から比較したい瞬間を選べます。
         """
     )
 
