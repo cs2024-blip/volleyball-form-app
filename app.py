@@ -51,8 +51,8 @@ VIDEO_EXTENSIONS = (
     ".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"
 )
 
-# 候補を作る間隔。0.1秒 = 1秒間に約10コマ
-FRAME_INTERVAL_SECONDS = 0.1
+# 候補を作る間隔。0.05秒 = 1秒間に約20コマ
+FRAME_INTERVAL_SECONDS = 0.05
 
 
 def detect_pose(rgb_image):
